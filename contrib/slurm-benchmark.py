@@ -44,24 +44,32 @@ class Benchmark(benchexec.benchexec.BenchExec):
             help="Use SLURM to execute benchmarks.",
         )
         slurm_args.add_argument(
+            "--slurm-mode",
+            dest="slurm_mode",
+            choices=["submit", "collect", "both"],
+            default="both",
+            help="Stage to execute: 'submit' only submits SLURM jobs, "
+            "'collect' only gathers results, 'both' does both (default).",
+        )
+        slurm_args.add_argument(
             "--singularity",
             dest="singularity",
             type=str,
-            help="The path to the singularity .sif file to use. Will bind $PWD to $HOME when run.",
+            help="The path to the singularity .sif file to use.",
         )
         slurm_args.add_argument(
             "--scratchdir",
             dest="scratchdir",
             type=str,
             default="./",
-            help="The directory where temporary directories can be created for use within singularity.",
+            help="Shared directory for intermediate results, accessible from all SLURM nodes.",
         )
         slurm_args.add_argument(
-            "--retry-killed",
-            dest="retry",
-            type=int,
-            default="0",
-            help="Retry killed jobs this many times. Use -1 for unbounded retry attempts.",
+            "--slurm-sbatch-args",
+            dest="slurm_sbatch_args",
+            type=str,
+            default="",
+            help="Extra arguments to pass to sbatch (e.g., '--partition=gpu --qos=high').",
         )
 
         return parser
