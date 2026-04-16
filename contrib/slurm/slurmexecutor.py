@@ -19,10 +19,10 @@ Stage 2 (collect): After the SLURM jobs finish and the results directory is
     BenchExec output (XML, tables, log files).
 
 Typical workflow:
-    1. Local:  python3 slurm-benchmark.py --slurm --slurm-mode=generate ...
-    2. User:   scp -r <scratchdir>/slurm_<benchmark>/ hpc:~/jobs/
-    3. HPC:    cd ~/jobs/slurm_<benchmark>/<runset>/ && sbatch job.sh
-    4. User:   scp -r hpc:~/jobs/slurm_<benchmark>/ <scratchdir>/
+    1. Local:  cd my-benchmark/ && python3 slurm-benchmark.py --slurm --slurm-mode=generate ...
+    2. User:   scp -r . hpc:~/my-benchmark/
+    3. HPC:    cd ~/my-benchmark/slurm/<runset>/ && sbatch job.sh
+    4. User:   scp -r hpc:~/my-benchmark/slurm/ ./slurm/
     5. Local:  python3 slurm-benchmark.py --slurm --slurm-mode=collect ...
 
 Resource measurement relies on cgroup v2 accounting provided by SLURM itself
@@ -61,12 +61,6 @@ def get_system_info():
 
 
 def execute_benchmark(benchmark, output_handler):
-    if not benchmark.config.scratchdir:
-        sys.exit(
-            "No scratchdir specified. Use --scratchdir <path> to set the "
-            "directory where the SLURM job bundle will be generated."
-        )
-
     mode = getattr(benchmark.config, "slurm_mode", "generate")
 
     for runSet in benchmark.run_sets:
@@ -120,11 +114,12 @@ def _execute_run_set(runSet, benchmark, output_handler, mode):
 
 
 def _results_dir_for_run_set(benchmark, runSet):
-    """Deterministic results directory path for a run set."""
-    scratchdir = benchmark.config.scratchdir
-    bench_name = benchmark.name
+    """Deterministic results directory path for a run set.
+
+    Always creates under ./slurm/<runset>/ in the current working directory.
+    """
     runset_name = runSet.real_name or f"runset_{runSet.index}"
-    return os.path.join(scratchdir, f"slurm_{bench_name}", runset_name)
+    return os.path.join("slurm", runset_name)
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +161,9 @@ def _stage_generate(runSet, benchmark, results_dir):
         os.path.abspath(results_dir),
     )
     logging.info("Next steps:")
-    logging.info("  1. Copy the bundle to your HPC login node")
-    logging.info("  2. cd into the bundle directory and run:  sbatch job.sh")
-    logging.info("  3. After all jobs finish, copy the bundle back")
+    logging.info("  1. Transfer the current directory to your HPC login node")
+    logging.info("  2. On HPC, cd into %s and run:  sbatch job.sh", results_dir)
+    logging.info("  3. After all jobs finish, copy the slurm/ directory back")
     logging.info(
         "  4. Run again with --slurm-mode=collect to produce BenchExec output"
     )
