@@ -8,14 +8,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Two-stage SLURM executor for BenchExec.
+"""Two-stage SLURM executor for BenchExec (offline workflow).
 
-Stage 1 (submit): Generates a SLURM array job. Each array task executes one
-    benchexec run, monitors its own cgroup-based resource usage, and writes
-    results (JSON + log) to a shared directory.
+Stage 1 (generate): Creates a self-contained directory with a SLURM array job
+    script, a manifest of all runs, and the worker script. This directory is
+    meant to be transferred to an HPC login node and submitted manually.
 
-Stage 2 (collect): Reads the results directory and produces normal BenchExec
-    output (XML, tables, etc.).
+Stage 2 (collect): After the SLURM jobs finish and the results directory is
+    copied back, this stage reads the per-task results and produces standard
+    BenchExec output (XML, tables, log files).
+
+Typical workflow:
+    1. Local:  python3 slurm-benchmark.py --slurm --slurm-mode=generate ...
+    2. User:   scp -r <scratchdir>/slurm_<benchmark>/ hpc:~/jobs/
+    3. HPC:    cd ~/jobs/slurm_<benchmark>/<runset>/ && sbatch job.sh
+    4. User:   scp -r hpc:~/jobs/slurm_<benchmark>/ <scratchdir>/
+    5. Local:  python3 slurm-benchmark.py --slurm --slurm-mode=collect ...
 
 Resource measurement relies on cgroup v2 accounting provided by SLURM itself
 (no custom cgroup creation needed).
@@ -26,7 +34,6 @@ import logging
 import os
 import shlex
 import shutil
-import subprocess
 import sys
 import time
 
@@ -38,7 +45,7 @@ sys.dont_write_bytecode = True
 STOPPED_BY_INTERRUPT = False
 
 # Path to the worker script, relative to this file
-_WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "slurm_worker.py")
+_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "slurm_worker.py")
 
 
 def init(config, benchmark):
@@ -56,11 +63,11 @@ def get_system_info():
 def execute_benchmark(benchmark, output_handler):
     if not benchmark.config.scratchdir:
         sys.exit(
-            "No scratchdir specified. Use --scratchdir <path> to set a shared "
-            "directory accessible from all SLURM nodes."
+            "No scratchdir specified. Use --scratchdir <path> to set the "
+            "directory where the SLURM job bundle will be generated."
         )
 
-    mode = getattr(benchmark.config, "slurm_mode", "both")
+    mode = getattr(benchmark.config, "slurm_mode", "generate")
 
     for runSet in benchmark.run_sets:
         if STOPPED_BY_INTERRUPT:
@@ -88,40 +95,28 @@ def _execute_run_set(runSet, benchmark, output_handler, mode):
     walltime_before = time.monotonic()
     output_handler.output_before_run_set(runSet)
 
-    # Create a results directory for this run set
     results_dir = _results_dir_for_run_set(benchmark, runSet)
     os.makedirs(results_dir, exist_ok=True)
 
-    if mode in ("submit", "both"):
-        _stage_submit(runSet, benchmark, results_dir)
-
-    if mode == "submit":
-        logging.info(
-            "Stage 1 complete: SLURM jobs submitted. Results will be written to %s",
-            results_dir,
-        )
-        logging.info(
-            "Run again with --slurm-mode=collect to gather results after jobs finish."
-        )
-        # We still need to call output_after_run_set for well-formedness,
-        # but skip per-run output
+    if mode == "generate":
+        _stage_generate(runSet, benchmark, results_dir)
         walltime_after = time.monotonic()
         output_handler.output_after_run_set(
             runSet, walltime=walltime_after - walltime_before
         )
         return
 
-    if mode in ("collect", "both"):
+    if mode == "collect":
         _stage_collect(runSet, benchmark, output_handler, results_dir)
+        walltime_after = time.monotonic()
+        if STOPPED_BY_INTERRUPT:
+            output_handler.set_error("interrupted", runSet)
+        output_handler.output_after_run_set(
+            runSet, walltime=walltime_after - walltime_before
+        )
+        return
 
-    walltime_after = time.monotonic()
-
-    if STOPPED_BY_INTERRUPT:
-        output_handler.set_error("interrupted", runSet)
-
-    output_handler.output_after_run_set(
-        runSet, walltime=walltime_after - walltime_before
-    )
+    sys.exit(f"Unknown --slurm-mode: {mode}")
 
 
 def _results_dir_for_run_set(benchmark, runSet):
@@ -129,19 +124,24 @@ def _results_dir_for_run_set(benchmark, runSet):
     scratchdir = benchmark.config.scratchdir
     bench_name = benchmark.name
     runset_name = runSet.real_name or f"runset_{runSet.index}"
-    return os.path.join(scratchdir, f"slurm_results_{bench_name}", runset_name)
+    return os.path.join(scratchdir, f"slurm_{bench_name}", runset_name)
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Submit
+# Stage 1: Generate
 # ---------------------------------------------------------------------------
 
 
-def _stage_submit(runSet, benchmark, results_dir):
-    """Create a manifest and submit a SLURM array job."""
+def _stage_generate(runSet, benchmark, results_dir):
+    """Create a self-contained SLURM job bundle in results_dir.
+
+    The bundle contains:
+      - manifest.json  — list of all tasks with command lines and limits
+      - slurm_worker.py — the worker script (copied so the bundle is portable)
+      - job.sh — sbatch script using only paths relative to the bundle dir
+    """
     manifest = _create_manifest(runSet, benchmark)
     manifest_path = os.path.join(results_dir, "manifest.json")
-
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -149,85 +149,29 @@ def _stage_submit(runSet, benchmark, results_dir):
     if num_tasks == 0:
         return
 
-    logging.info(
-        "Submitting SLURM array job with %d tasks for run set %s",
-        num_tasks,
-        runSet.real_name or runSet.index,
-    )
+    # Copy worker script into the bundle so it's self-contained
+    worker_dest = os.path.join(results_dir, "slurm_worker.py")
+    shutil.copy2(_WORKER_SCRIPT, worker_dest)
 
-    job_script = _generate_job_script(benchmark, manifest_path, results_dir)
+    # Generate the sbatch script with *relative* paths
+    job_script = _generate_job_script(benchmark, num_tasks)
     job_script_path = os.path.join(results_dir, "job.sh")
     with open(job_script_path, "w") as f:
         f.write(job_script)
     os.chmod(job_script_path, 0o755)
 
-    # Submit via sbatch
-    sbatch_cmd = ["sbatch", "--parsable"]
-
-    # Resource limits
-    timelimit = benchmark.rlimits.cputime
-    walltime = benchmark.rlimits.walltime
-    # Use walltime if available, else use cputime with a generous margin
-    effective_limit = walltime or (timelimit * 2 if timelimit else None)
-    if effective_limit:
-        h = int(effective_limit // 3600)
-        m = int((effective_limit % 3600) // 60)
-        s = int(effective_limit % 60)
-        sbatch_cmd.extend(["-t", f"{h}:{m:02d}:{s:02d}"])
-
-    cpus = benchmark.rlimits.cpu_cores
-    if cpus:
-        sbatch_cmd.extend(["-c", str(cpus)])
-
-    memory = benchmark.rlimits.memory
-    if memory:
-        sbatch_cmd.extend(["--mem", f"{int(memory / 1_000_000)}M"])
-
-    sbatch_cmd.extend(["--threads-per-core=1"])
-    sbatch_cmd.extend([f"--array=0-{num_tasks - 1}"])
-
-    # Limit concurrent tasks if num_of_threads is set
-    if benchmark.num_of_threads and benchmark.num_of_threads < num_tasks:
-        sbatch_cmd[-1] += f"%{benchmark.num_of_threads}"
-
-    sbatch_cmd.extend(["--job-name", f"benchexec_{benchmark.name}"])
-    sbatch_cmd.extend(
-        [
-            "--output",
-            os.path.join(results_dir, "slurm_%A_%a.out"),
-        ]
+    logging.info(
+        "Generated SLURM job bundle with %d tasks in: %s",
+        num_tasks,
+        os.path.abspath(results_dir),
     )
-
-    # Extra SLURM options from config
-    extra = getattr(benchmark.config, "slurm_sbatch_args", None)
-    if extra:
-        sbatch_cmd.extend(shlex.split(extra))
-
-    sbatch_cmd.append(job_script_path)
-
-    logging.debug("sbatch command: %s", shlex.join(sbatch_cmd))
-
-    try:
-        result = subprocess.run(
-            sbatch_cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        job_id = result.stdout.strip().split(";")[0]
-        logging.info("Submitted SLURM array job %s", job_id)
-
-        # Save job ID for tracking
-        with open(os.path.join(results_dir, "job_id"), "w") as f:
-            f.write(job_id)
-
-    except subprocess.CalledProcessError as e:
-        raise BenchExecException(
-            f"Failed to submit SLURM job: {e.stderr.strip()}"
-        ) from e
-
-    # In "both" mode, wait for the job to complete
-    _wait_for_job(job_id, results_dir, num_tasks)
+    logging.info("Next steps:")
+    logging.info("  1. Copy the bundle to your HPC login node")
+    logging.info("  2. cd into the bundle directory and run:  sbatch job.sh")
+    logging.info("  3. After all jobs finish, copy the bundle back")
+    logging.info(
+        "  4. Run again with --slurm-mode=collect to produce BenchExec output"
+    )
 
 
 def _create_manifest(runSet, benchmark):
@@ -251,94 +195,84 @@ def _create_manifest(runSet, benchmark):
     return {"tasks": tasks}
 
 
-def _generate_job_script(benchmark, manifest_path, results_dir):
-    """Generate a SLURM batch script that runs the worker."""
-    worker_script = os.path.abspath(_WORKER_SCRIPT)
-    manifest_abs = os.path.abspath(manifest_path)
-    results_abs = os.path.abspath(results_dir)
+def _generate_job_script(benchmark, num_tasks):
+    """Generate a SLURM batch script using paths relative to the script dir.
+
+    All paths in the script are relative to BUNDLE_DIR (the directory
+    containing job.sh), so the bundle can be placed anywhere on the HPC.
+    """
+    lines = [
+        "#!/bin/bash",
+    ]
+
+    # ---------- SBATCH directives ----------
+    lines.append("#SBATCH --ntasks=1")
+
+    timelimit = benchmark.rlimits.cputime
+    walltime = benchmark.rlimits.walltime
+    effective_limit = walltime or (timelimit * 2 if timelimit else None)
+    if effective_limit:
+        h = int(effective_limit // 3600)
+        m = int((effective_limit % 3600) // 60)
+        s = int(effective_limit % 60)
+        lines.append(f"#SBATCH --time={h}:{m:02d}:{s:02d}")
+
+    cpus = benchmark.rlimits.cpu_cores
+    if cpus:
+        lines.append(f"#SBATCH --cpus-per-task={cpus}")
+
+    memory = benchmark.rlimits.memory
+    if memory:
+        lines.append(f"#SBATCH --mem={int(memory / 1_000_000)}M")
+
+    lines.append("#SBATCH --threads-per-core=1")
+
+    array_spec = f"0-{num_tasks - 1}"
+    if benchmark.num_of_threads and benchmark.num_of_threads < num_tasks:
+        array_spec += f"%{benchmark.num_of_threads}"
+    lines.append(f"#SBATCH --array={array_spec}")
+
+    lines.append(f"#SBATCH --job-name=benchexec_{benchmark.name}")
+    lines.append("#SBATCH --output=slurm_%A_%a.out")
+
+    # Extra sbatch args (embedded as directives)
+    extra = getattr(benchmark.config, "slurm_sbatch_args", None)
+    if extra:
+        for arg in shlex.split(extra):
+            if arg.startswith("--"):
+                lines.append(f"#SBATCH {arg}")
+            elif arg.startswith("-"):
+                lines.append(f"#SBATCH {arg}")
+
+    lines.append("")
+    lines.append("# Auto-generated by BenchExec SLURM executor")
+    lines.append("# All paths are relative to this script's directory.")
+    lines.append('BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"')
+    lines.append("")
 
     singularity = getattr(benchmark.config, "singularity", None)
-
     if singularity:
-        # Inside singularity: bind CWD as /lower, results dir, and the worker
-        worker_cmd = (
+        lines.append(
             f"singularity exec"
             f" -B ./:/lower"
             f" --no-home"
-            f" -B {shlex.quote(results_abs)}:{shlex.quote(results_abs)}"
-            f" -B {shlex.quote(os.path.dirname(worker_script))}:"
-            f"{shlex.quote(os.path.dirname(worker_script))}"
+            f' -B "$BUNDLE_DIR":"$BUNDLE_DIR"'
             f" {shlex.quote(singularity)}"
-            f" python3 {shlex.quote(worker_script)}"
-            f" {shlex.quote(manifest_abs)}"
+            f' python3 "$BUNDLE_DIR/slurm_worker.py"'
+            f' "$BUNDLE_DIR/manifest.json"'
             f" $SLURM_ARRAY_TASK_ID"
-            f" {shlex.quote(results_abs)}"
+            f' "$BUNDLE_DIR"'
         )
     else:
-        worker_cmd = (
-            f"python3 {shlex.quote(worker_script)}"
-            f" {shlex.quote(manifest_abs)}"
+        lines.append(
+            f'python3 "$BUNDLE_DIR/slurm_worker.py"'
+            f' "$BUNDLE_DIR/manifest.json"'
             f" $SLURM_ARRAY_TASK_ID"
-            f" {shlex.quote(results_abs)}"
+            f' "$BUNDLE_DIR"'
         )
 
-    return f"""#!/bin/bash
-#SBATCH --ntasks=1
-# Auto-generated by BenchExec SLURM executor
-
-{worker_cmd}
-"""
-
-
-def _wait_for_job(job_id, results_dir, num_tasks):
-    """Wait for a SLURM array job to complete."""
-    logging.info(
-        "Waiting for SLURM job %s to complete (%d tasks)...", job_id, num_tasks
-    )
-
-    while not STOPPED_BY_INTERRUPT:
-        try:
-            result = subprocess.run(
-                [
-                    "squeue",
-                    "--job",
-                    str(job_id),
-                    "--noheader",
-                    "--format=%t",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            # If no lines in output, all tasks are done
-            active = [
-                line.strip()
-                for line in result.stdout.strip().split("\n")
-                if line.strip()
-            ]
-            if not active:
-                logging.info("All SLURM tasks completed for job %s", job_id)
-                break
-
-            running = sum(1 for s in active if s == "R")
-            pending = sum(1 for s in active if s == "PD")
-            logging.debug(
-                "Job %s: %d running, %d pending, %d other",
-                job_id,
-                running,
-                pending,
-                len(active) - running - pending,
-            )
-        except OSError as e:
-            logging.warning("Failed to check job status: %s", e)
-
-        time.sleep(10)
-
-    if STOPPED_BY_INTERRUPT:
-        logging.info("Cancelling SLURM job %s", job_id)
-        try:
-            subprocess.run(["scancel", str(job_id)], check=False)
-        except OSError:
-            pass
+    lines.append("")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +286,7 @@ def _stage_collect(runSet, benchmark, output_handler, results_dir):
     if not os.path.exists(manifest_path):
         raise BenchExecException(
             f"Manifest not found at {manifest_path}. "
-            f"Run with --slurm-mode=submit first."
+            f"Run with --slurm-mode=generate first."
         )
 
     for i, run in enumerate(runSet.runs):

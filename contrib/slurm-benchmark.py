@@ -46,10 +46,10 @@ class Benchmark(benchexec.benchexec.BenchExec):
         slurm_args.add_argument(
             "--slurm-mode",
             dest="slurm_mode",
-            choices=["submit", "collect", "both"],
-            default="both",
-            help="Stage to execute: 'submit' only submits SLURM jobs, "
-            "'collect' only gathers results, 'both' does both (default).",
+            choices=["generate", "collect"],
+            default="generate",
+            help="Stage to execute: 'generate' creates a SLURM job bundle "
+            "locally, 'collect' gathers results after the jobs finish.",
         )
         slurm_args.add_argument(
             "--singularity",
