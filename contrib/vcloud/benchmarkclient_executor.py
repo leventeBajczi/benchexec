@@ -303,6 +303,15 @@ def getBenchmarkDataForCloud(benchmark):
 
         # get runs
         for run in runSet.runs:
+            if os.path.exists(run.log_file) and os.path.exists(run.log_file + ".data"):
+                logging.info(
+                    "Skipping run %s because result files already exist: %s and %s",
+                    run.identifier,
+                    run.log_file,
+                    run.log_file + ".data",
+                )
+                continue
+
             cmdline = run.cmdline()
             cmdline = list(map(vcloudutil.force_linux_path, cmdline))
 
@@ -323,6 +332,9 @@ def getBenchmarkDataForCloud(benchmark):
                     toTabList([argString, log_file] + run.required_files)
                 )
             sourceFiles.extend(run.sourcefiles)
+
+    numberOfRuns = len(runDefinitions)
+    limitsAndNumRuns[0] = numberOfRuns
 
     if not runDefinitions:
         sys.exit("Benchmark has nothing to run.")
